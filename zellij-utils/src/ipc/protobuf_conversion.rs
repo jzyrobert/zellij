@@ -1,7 +1,8 @@
 use crate::{
     client_server_contract::client_server_contract::{
         client_to_server_msg, server_to_client_msg, ActionMsg, AttachClientMsg,
-        AttachWatcherClientMsg, BackgroundColorMsg, CliPipeOutputMsg, ClientExitedMsg,
+        AttachWatcherClientMsg, BackgroundColorMsg, ChangeFocusedPaneCwdIfShellMsg,
+        CliPipeOutputMsg, ClientExitedMsg,
         ClientToServerMsg as ProtoClientToServerMsg, ColorRegistersMsg, ConfigFileUpdatedMsg,
         ConnStatusMsg, ConnectedMsg, DesktopNotificationResponseMsg, DetachSessionMsg, ExitMsg,
         ExitReason as ProtoExitReason, FailedToStartWebServerMsg, FirstClientConnectedMsg,
@@ -146,6 +147,13 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                     },
                 )
             },
+            ClientToServerMsg::ChangeFocusedPaneCwdIfShell { path } => {
+                client_to_server_msg::Message::ChangeFocusedPaneCwdIfShell(
+                    ChangeFocusedPaneCwdIfShellMsg {
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                )
+            },
         };
 
         ProtoClientToServerMsg {
@@ -285,6 +293,11 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                     .ok_or_else(|| anyhow!("Unknown HostTerminalThemeIndication: {}", msg.mode))?;
                 Ok(ClientToServerMsg::HostTerminalThemeChanged {
                     mode: proto_mode.into(),
+                })
+            },
+            Some(client_to_server_msg::Message::ChangeFocusedPaneCwdIfShell(msg)) => {
+                Ok(ClientToServerMsg::ChangeFocusedPaneCwdIfShell {
+                    path: PathBuf::from(msg.path),
                 })
             },
             None => Err(anyhow!("Empty ClientToServerMsg message")),

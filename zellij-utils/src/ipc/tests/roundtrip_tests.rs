@@ -3569,6 +3569,19 @@ fn test_client_messages() {
     test_client_roundtrip!(ClientToServerMsg::HostTerminalThemeChanged {
         mode: HostTerminalThemeMode::Light,
     });
+    // Wire-format contract for the U4 deep-link variant. Locks the
+    // proto field-21 tag plus the byte-for-byte path payload so a
+    // future schema edit cannot silently break the on-wire shape that
+    // older servers ignore via prost's unknown-oneof handling (R10).
+    test_client_roundtrip!(ClientToServerMsg::ChangeFocusedPaneCwdIfShell {
+        path: PathBuf::from("/tmp/foo"),
+    });
+    test_client_roundtrip!(ClientToServerMsg::ChangeFocusedPaneCwdIfShell {
+        path: PathBuf::from("/srv/projects/with spaces/and-éscapéd"),
+    });
+    test_client_roundtrip!(ClientToServerMsg::ChangeFocusedPaneCwdIfShell {
+        path: PathBuf::from("/"),
+    });
 }
 
 fn test_server_messages() {

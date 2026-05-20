@@ -12,6 +12,7 @@ use std::{
     fmt::{Display, Error, Formatter},
     io::{self, Read, Write},
     marker::PhantomData,
+    path::PathBuf,
 };
 
 // Protobuf imports
@@ -170,6 +171,16 @@ pub enum ClientToServerMsg {
     /// theme and to subscribed plugins/panes.
     HostTerminalThemeChanged {
         mode: HostTerminalThemeMode,
+    },
+    /// Web-client deep-link request: if the focused pane is a known
+    /// sh-family shell sitting at an idle prompt, type
+    /// `cd '<path>'\n` into it. The server enforces read-only,
+    /// shell-allowlist, and foreground-idle checks before acting; the
+    /// path itself is validated client-side so the on-wire payload is
+    /// safe to splice byte-for-byte. Best-effort: any guard failure is
+    /// a silent no-op (logged at trace level).
+    ChangeFocusedPaneCwdIfShell {
+        path: PathBuf,
     },
 }
 

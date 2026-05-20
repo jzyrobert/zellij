@@ -477,3 +477,189 @@ fn osc7_then_poll_skips_terminal() {
         "poll after osc7 should skip terminal since flag was cleared"
     );
 }
+
+// --- U4: cd-if-shell deep link routing ---
+
+use crate::screen::ScreenInstruction;
+
+/// Builds a Pty bus wired to both Plugin and Screen receivers, so tests
+/// can observe the `ScreenInstruction::WriteToPaneId` payload that the
+/// cd-if-shell handler emits.
+fn make_pty_with_screen_receiver(
+    mock: MockOsApi,
+) -> (
+    Pty,
+    channels::Receiver<(ScreenInstruction, ErrorContext)>,
+) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let plugin_sender = SenderWithContext::new(plugin_tx);
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let screen_sender = SenderWithContext::new(screen_tx);
+    let mut bus: Bus<PtyInstruction> = Bus::empty();
+    bus.senders.should_silently_fail = false;
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(plugin_sender);
+    bus.senders.to_screen = Some(screen_sender);
+    let pty = Pty::new(bus, false, None, None);
+    (pty, screen_rx)
+}
+
+fn collect_write_to_pane_id(
+    rx: &channels::Receiver<(ScreenInstruction, ErrorContext)>,
+) -> Vec<(Vec<u8>, PaneId)> {
+    let mut out = Vec::new();
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let ScreenInstruction::WriteToPaneId(bytes, pane_id, _) = instruction {
+            out.push((bytes, pane_id));
+        }
+    }
+    out
+}
+
+#[test]
+fn cd_if_shell_writes_payload_for_idle_bash() {
+    // Empty foreground vec + bash spawn → must emit the literal
+    // payload `cd '<path>'\n` to the focused pane. Locks the wire
+    // shape that the U2 validator was designed to make safe.
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(7, PaneId::Terminal(42));
+    pty.terminal_cmds.insert(42, vec!["/bin/bash".into()]);
+    pty.terminal_foreground_cmds.insert(42, vec![]);
+
+    pty.cd_if_shell_on_focused_pane(7, PathBuf::from("/tmp/foo"), 0);
+
+    let writes = collect_write_to_pane_id(&screen_rx);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1, PaneId::Terminal(42));
+    assert_eq!(writes[0].0, b"cd '/tmp/foo'\n".to_vec());
+}
+
+#[test]
+fn cd_if_shell_preserves_spaces_in_path() {
+    // Validator rejects single quotes and shell metas, so spaces just
+    // appear inside the single-quoted token — no escape pass needed.
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(1, PaneId::Terminal(10));
+    pty.terminal_cmds.insert(10, vec!["zsh".into()]);
+    pty.terminal_foreground_cmds.insert(10, vec![]);
+
+    pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/with space"), 0);
+
+    let writes = collect_write_to_pane_id(&screen_rx);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, b"cd '/tmp/with space'\n".to_vec());
+}
+
+#[test]
+fn cd_if_shell_drops_when_foreground_command_is_running() {
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(7, PaneId::Terminal(42));
+    pty.terminal_cmds.insert(42, vec!["bash".into()]);
+    pty.terminal_foreground_cmds.insert(42, vec!["vim".into()]);
+
+    pty.cd_if_shell_on_focused_pane(7, PathBuf::from("/tmp/foo"), 0);
+
+    assert!(
+        collect_write_to_pane_id(&screen_rx).is_empty(),
+        "non-empty foreground must suppress the cd write"
+    );
+}
+
+#[test]
+fn cd_if_shell_drops_when_shell_not_in_allowlist() {
+    // csh / tcsh / fish-pre-allowlisting / nushell / pwsh / cmd /
+    // unknown — none of these get the cd nudge. Single subtest per
+    // shell-family confirms the negative is uniform across the matrix.
+    for spawn in [
+        "csh", "tcsh", "/usr/bin/nushell", "nu", "powershell", "pwsh", "cmd",
+        "cmd.exe", "/usr/local/bin/myshell",
+    ] {
+        let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+        pty.active_panes.insert(1, PaneId::Terminal(99));
+        pty.terminal_cmds.insert(99, vec![spawn.into()]);
+        pty.terminal_foreground_cmds.insert(99, vec![]);
+
+        pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/foo"), 0);
+
+        assert!(
+            collect_write_to_pane_id(&screen_rx).is_empty(),
+            "spawn {:?} should not receive a cd nudge",
+            spawn,
+        );
+    }
+}
+
+#[test]
+fn cd_if_shell_matches_allowlist_case_insensitively() {
+    // Robustness against weirdly-cased basenames — `/bin/Bash`,
+    // `/usr/bin/BASH` should still match the allowlist.
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(1, PaneId::Terminal(10));
+    pty.terminal_cmds.insert(10, vec!["/bin/BASH".into()]);
+    pty.terminal_foreground_cmds.insert(10, vec![]);
+
+    pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/foo"), 0);
+
+    let writes = collect_write_to_pane_id(&screen_rx);
+    assert_eq!(writes.len(), 1);
+}
+
+#[test]
+fn cd_if_shell_drops_when_focused_pane_is_plugin() {
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(1, PaneId::Plugin(7));
+
+    pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/foo"), 0);
+
+    assert!(collect_write_to_pane_id(&screen_rx).is_empty());
+}
+
+#[test]
+fn cd_if_shell_drops_after_retry_when_active_pane_still_missing() {
+    // attempt > 0 short-circuits the reschedule; we exercise the
+    // "missing → drop" arm without waiting on a real retry thread.
+    let (pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.cd_if_shell_on_focused_pane(99, PathBuf::from("/tmp/foo"), 1);
+    assert!(collect_write_to_pane_id(&screen_rx).is_empty());
+}
+
+#[test]
+fn cd_if_shell_drops_after_retry_when_foreground_state_still_unknown() {
+    // After the deferred retry also returns None — drop, don't loop.
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(1, PaneId::Terminal(42));
+    pty.terminal_cmds.insert(42, vec!["bash".into()]);
+    pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/foo"), 1);
+    assert!(collect_write_to_pane_id(&screen_rx).is_empty());
+}
+
+#[test]
+fn cd_if_shell_drops_when_no_spawn_command_recorded() {
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+    pty.active_panes.insert(1, PaneId::Terminal(42));
+    pty.terminal_foreground_cmds.insert(42, vec![]);
+
+    pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/tmp/foo"), 0);
+
+    assert!(collect_write_to_pane_id(&screen_rx).is_empty());
+}
+
+#[test]
+fn cd_if_shell_emits_for_every_allowlisted_shell() {
+    use crate::pty::CD_IF_SHELL_ALLOWLIST;
+    for shell in CD_IF_SHELL_ALLOWLIST {
+        let (mut pty, screen_rx) = make_pty_with_screen_receiver(MockOsApi::new());
+        pty.active_panes.insert(1, PaneId::Terminal(42));
+        pty.terminal_cmds.insert(42, vec![(*shell).into()]);
+        pty.terminal_foreground_cmds.insert(42, vec![]);
+
+        pty.cd_if_shell_on_focused_pane(1, PathBuf::from("/x"), 0);
+        let writes = collect_write_to_pane_id(&screen_rx);
+        assert_eq!(
+            writes.len(),
+            1,
+            "allowlisted shell {:?} should receive the cd nudge",
+            shell,
+        );
+    }
+}

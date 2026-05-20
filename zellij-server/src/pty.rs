@@ -155,8 +155,41 @@ pub enum PtyInstruction {
     },
     UpdateAndReportCwds,
     NotifyCwdFromOsc7(u32, PathBuf),
+    /// Web-client deep-link "cd if shell" routing. Inputs:
+    /// - `client_id`: the issuing client (read-only check happens in
+    ///   `route.rs` before this is dispatched, so by the time we reach
+    ///   the pty handler the client is authorized to write).
+    /// - `path`: validated absolute path (no single quotes, no shell
+    ///   metacharacters, no `..` components — see
+    ///   `validate_deep_link_path`).
+    /// - `attempt`: 0 on first dispatch, incremented once if the
+    ///   foreground-cmd scan hasn't run yet for the focused terminal
+    ///   (`UPDATE_AND_REPORT_CWDS_INTERVAL_MS = 1000ms` race window).
+    ///   The handler self-reschedules at most once via a short-lived
+    ///   thread, then drops.
+    CdIfShellOnFocusedPane {
+        client_id: ClientId,
+        path: PathBuf,
+        attempt: u8,
+    },
     Exit,
 }
+
+/// Sh-family shells whose single-quoted strings are literal byte
+/// sequences. Deep-link "cd if shell" only fires for these — for
+/// csh/tcsh/fish/PowerShell/cmd the action is a silent no-op (see R9).
+/// Matched against the basename of the pane's spawn command,
+/// case-insensitively, so `/bin/bash`, `/usr/local/bin/Bash`, and bare
+/// `bash` all match.
+pub const CD_IF_SHELL_ALLOWLIST: &[&str] = &[
+    "bash", "zsh", "sh", "dash", "ksh", "ash", "mksh", "fish",
+];
+
+/// Delay before the cd-if-shell handler retries when the foreground-cmd
+/// scan hasn't yet observed the focused terminal. One full scan
+/// interval plus a small slack; bounded to a single retry so a stuck
+/// pty thread cannot leak the deep link.
+const CD_IF_SHELL_RETRY_DELAY_MS: u64 = 1100;
 
 impl From<&PtyInstruction> for PtyContext {
     fn from(pty_instruction: &PtyInstruction) -> Self {
@@ -188,6 +221,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::GetPaneCwd { .. } => PtyContext::GetPaneCwd,
             PtyInstruction::UpdateAndReportCwds => PtyContext::UpdateAndReportCwds,
             PtyInstruction::NotifyCwdFromOsc7(..) => PtyContext::NotifyCwdFromOsc7,
+            PtyInstruction::CdIfShellOnFocusedPane { .. } => PtyContext::CdIfShellOnFocusedPane,
             PtyInstruction::Exit => PtyContext::Exit,
         }
     }
@@ -897,6 +931,13 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             },
             PtyInstruction::NotifyCwdFromOsc7(terminal_id, path) => {
                 pty.notify_cwd_from_osc7(terminal_id, path);
+            },
+            PtyInstruction::CdIfShellOnFocusedPane {
+                client_id,
+                path,
+                attempt,
+            } => {
+                pty.cd_if_shell_on_focused_pane(client_id, path, attempt);
             },
             PtyInstruction::Exit => break,
         }
@@ -2210,6 +2251,110 @@ impl Pty {
         if let Some(flag) = self.pane_activity_flags.get(&terminal_id) {
             flag.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Implements the U4 "cd if shell" path: when a web-client deep
+    /// link asks the server to type `cd '<path>'` into the focused
+    /// pane, this performs the four short-circuit guards (active pane
+    /// known, terminal not plugin, spawn-shell in the allowlist,
+    /// foreground-cmd table reports idle), with one deferred retry if
+    /// the foreground-cmd scan hasn't run yet for the freshly-spawned
+    /// pane. All failures are silent trace-level logs — this is a
+    /// best-effort UX nudge, not a contract the user can rely on.
+    pub fn cd_if_shell_on_focused_pane(&self, client_id: ClientId, path: PathBuf, attempt: u8) {
+        let Some(pane_id) = self.active_panes.get(&client_id).copied() else {
+            if attempt == 0 {
+                self.reschedule_cd_if_shell(client_id, path, attempt + 1);
+            } else {
+                log::trace!(
+                    "cd-if-shell: no active pane for client {} after retry; dropping",
+                    client_id
+                );
+            }
+            return;
+        };
+        let terminal_id = match pane_id {
+            PaneId::Terminal(id) => id,
+            PaneId::Plugin(plugin_id) => {
+                log::trace!(
+                    "cd-if-shell: focused pane is plugin {}; dropping",
+                    plugin_id
+                );
+                return;
+            },
+        };
+        let Some(shell_basename) = self
+            .terminal_cmds
+            .get(&terminal_id)
+            .and_then(|cmd| cmd.first())
+            .and_then(|first| {
+                std::path::Path::new(first)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            })
+        else {
+            log::trace!(
+                "cd-if-shell: no spawn command recorded for terminal {}; dropping",
+                terminal_id
+            );
+            return;
+        };
+        if !CD_IF_SHELL_ALLOWLIST.contains(&shell_basename.as_str()) {
+            log::trace!(
+                "cd-if-shell: shell {:?} not in allowlist for terminal {}; dropping",
+                shell_basename,
+                terminal_id,
+            );
+            return;
+        }
+        match self.terminal_foreground_cmds.get(&terminal_id) {
+            Some(fg) if fg.is_empty() => {
+                // Shell idle → send the fixed-shape payload. Validator
+                // guarantees `path` has no single quote / shell meta /
+                // control byte, so no escape pass is needed.
+                let bytes = format!("cd '{}'\n", path.display()).into_bytes();
+                if let Err(e) = self
+                    .bus
+                    .senders
+                    .send_to_screen(ScreenInstruction::WriteToPaneId(bytes, pane_id, None))
+                {
+                    log::error!("cd-if-shell: failed to dispatch WriteToPaneId: {:?}", e);
+                }
+            },
+            Some(fg) => {
+                log::trace!(
+                    "cd-if-shell: terminal {} has foreground command {:?}; dropping",
+                    terminal_id,
+                    fg.first().map(|s| s.as_str()).unwrap_or(""),
+                );
+            },
+            None => {
+                if attempt == 0 {
+                    self.reschedule_cd_if_shell(client_id, path, attempt + 1);
+                } else {
+                    log::trace!(
+                        "cd-if-shell: terminal {} has no foreground scan after retry; dropping",
+                        terminal_id,
+                    );
+                }
+            },
+        }
+    }
+
+    /// Spawn a one-shot timer thread that re-dispatches the cd-if-shell
+    /// instruction to the pty queue once. Used to bridge the
+    /// `UPDATE_AND_REPORT_CWDS_INTERVAL_MS` (~1000ms) window where a
+    /// freshly-spawned pane has no foreground-cmd entry yet.
+    fn reschedule_cd_if_shell(&self, client_id: ClientId, path: PathBuf, attempt: u8) {
+        let senders = self.bus.senders.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(CD_IF_SHELL_RETRY_DELAY_MS));
+            let _ = senders.send_to_pty(PtyInstruction::CdIfShellOnFocusedPane {
+                client_id,
+                path,
+                attempt,
+            });
+        });
     }
 
     pub fn send_sigint_to_pane(&self, pane_id: PaneId) {

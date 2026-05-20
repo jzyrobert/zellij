@@ -30,6 +30,7 @@ pub fn zellij_server_listener(
     web_client_id: String,
     session_manager: Arc<dyn SessionManager>,
     attachment_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    initial_cwd: Option<PathBuf>,
 ) {
     let _server_listener_thread = std::thread::Builder::new()
         .name("server_listener".to_string())
@@ -37,8 +38,12 @@ pub fn zellij_server_listener(
             move || {
                 let mut client_connection_bus =
                     ClientConnectionBus::new(&web_client_id, &connection_table);
+                // `.take()` inside the loop body consumes the deep-link cwd
+                // on iteration 1; SwitchedSession-triggered re-entries see
+                // None unconditionally.
+                let mut initial_cwd = initial_cwd;
                 let mut reconnect_to_session =
-                    match build_initial_connection(session_name, &config) {
+                    match build_initial_connection(session_name, initial_cwd.clone(), &config) {
                         Ok(initial_session_connection) => initial_session_connection,
                         Err(e) => {
                             log::error!("{}", e);
@@ -48,6 +53,7 @@ pub fn zellij_server_listener(
                 let mut attachment_complete_tx = attachment_complete_tx;
                 'reconnect_loop: loop {
                     let reconnect_info = reconnect_to_session.take();
+                    let cwd_this_iteration = initial_cwd.take();
                     let initial_layout = reconnect_info.as_ref().and_then(|r| r.layout.clone());
                     let path = {
                         let Some(session_name) = reconnect_info
@@ -109,7 +115,16 @@ pub fn zellij_server_listener(
                     }
 
                     let should_create_new_session = !session_exists;
-                    let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout);
+                    // New session → cwd is baked into CliAssets.
+                    // Existing session → cwd is held for the cd-if-shell
+                    // nudge after ServerToClientMsg::Connected arrives.
+                    let (first_message_cwd, mut pending_cd_if_shell_path) =
+                        if should_create_new_session {
+                            (cwd_this_iteration, None)
+                        } else {
+                            (None, cwd_this_iteration)
+                        };
+                    let first_message = create_first_message(is_read_only, config_file_path.clone(), client_attributes.clone(), config_options.clone(), should_create_new_session, &session_name, initial_layout, first_message_cwd);
                     let zellij_ipc_pipe = create_ipc_pipe(&session_name);
 
                     session_manager.spawn_session_if_needed(
@@ -151,7 +166,16 @@ pub fn zellij_server_listener(
                         }
                         match msg.map(|m| m.0) {
                             Some(ServerToClientMsg::UnblockInputThread) => {},
-                            Some(ServerToClientMsg::Connected) => {},
+                            Some(ServerToClientMsg::Connected) => {
+                                // Wait for Connected before sending
+                                // cd-if-shell so active_panes[client_id]
+                                // is installed server-side first.
+                                if let Some(path) = pending_cd_if_shell_path.take() {
+                                    os_input.send_to_server(
+                                        ClientToServerMsg::ChangeFocusedPaneCwdIfShell { path },
+                                    );
+                                }
+                            },
                             Some(ServerToClientMsg::CliPipeOutput { .. } ) => {},
                             Some(ServerToClientMsg::UnblockCliPipeInput { .. } ) => {},
                             Some(ServerToClientMsg::StartWebServer { .. } ) => {},

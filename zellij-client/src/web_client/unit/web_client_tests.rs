@@ -2822,6 +2822,534 @@ mod web_client_tests {
         server_handle.abort();
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // ========== U5: deep-link `?path=` end-to-end coverage ==========
+
+    /// Spin up `serve_web_client` with the given mocks, mint a regular
+    /// auth token, log in, and POST `/session` to obtain a fresh
+    /// `web_client_id`. Returns everything callers need to drive the
+    /// terminal/control WebSockets next: the listening port, the
+    /// session-cookie value, and the `web_client_id` issued by `/session`.
+    async fn boot_web_server(
+        mock_session_manager: Arc<MockSessionManager>,
+        mock_os_api_factory: Arc<MockClientOsApiFactory>,
+        auth_token_name: &str,
+    ) -> (
+        u16,
+        String,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (auth_token, _) = create_token(Some(auth_token_name.to_string()), false)
+            .expect("Failed to create test token");
+        let config = Config::default();
+        let options = Options::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let ip = addr.ip();
+        let temp_config_path = std::env::temp_dir().join("test_config_deep_link.kdl");
+        let server_handle = tokio::spawn(async move {
+            serve_web_client(
+                config,
+                options,
+                Some(temp_config_path),
+                listener,
+                None,
+                Some(mock_session_manager),
+                Some(mock_os_api_factory),
+                ip,
+                port,
+            )
+            .await;
+        });
+        wait_for_server(port, Duration::from_secs(5))
+            .await
+            .expect("Server should start");
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let web_client_id = create_client_session(port, &session_token).await;
+        (port, session_token, web_client_id, server_handle)
+    }
+
+    /// Locate the single MockClientOsApi created by the factory during
+    /// `boot_web_server`. The factory issues exactly one os_api per
+    /// `/session` POST, so it is the one the listener thread is
+    /// driving.
+    fn single_mock_os_api(
+        factory: &Arc<MockClientOsApiFactory>,
+    ) -> Arc<MockClientOsApi> {
+        let map = factory.mock_apis.lock().unwrap();
+        assert_eq!(
+            map.len(),
+            1,
+            "expected exactly one mock os_api for the single test client, got {}",
+            map.len()
+        );
+        map.values().next().unwrap().clone()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_new_session_cwd_propagates_to_first_client_connected() {
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::new());
+        let session_manager_for_verification = mock_session_manager.clone();
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_new",
+        )
+        .await;
+
+        // ?path= flows through the terminal WS query argument (the
+        // page URL `?path=` has already been stripped client-side by
+        // index.js — the value the server cares about lives here).
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path={}",
+            port,
+            web_client_id,
+            "%2Ftmp%2Fdeep"
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let messages = session_manager_for_verification
+            .first_messages_sent
+            .lock()
+            .unwrap()
+            .clone();
+        let (_session_name, msg) = messages
+            .first()
+            .expect("session manager should have received a first message");
+        match msg {
+            ClientToServerMsg::FirstClientConnected { cli_assets, .. } => {
+                assert_eq!(
+                    cli_assets.cwd,
+                    Some(PathBuf::from("/tmp/deep")),
+                    "CliAssets.cwd should carry the deep-link path on new-session creation"
+                );
+                // Bypassing welcome on path-without-name is part of the
+                // contract — assert via the LayoutInfo that we did NOT
+                // land on the welcome plugin.
+                assert!(
+                    !matches!(
+                        cli_assets.layout,
+                        Some(zellij_utils::data::LayoutInfo::BuiltIn(ref n)) if n == "welcome"
+                    ),
+                    "deep link must bypass the welcome layout, saw {:?}",
+                    cli_assets.layout
+                );
+            },
+            other => panic!("expected FirstClientConnected, got {:?}", other),
+        }
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_with_no_path_leaves_cwd_none() {
+        // Regression guard for R5: omitting `?path=` must not synthesize
+        // a cwd. Same flow as the previous test but without the path
+        // query argument.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::new());
+        let session_manager_for_verification = mock_session_manager.clone();
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_none",
+        )
+        .await;
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}",
+            port, web_client_id,
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let messages = session_manager_for_verification
+            .first_messages_sent
+            .lock()
+            .unwrap()
+            .clone();
+        let (_n, msg) = messages.first().expect("first_message captured");
+        if let ClientToServerMsg::FirstClientConnected { cli_assets, .. } = msg {
+            assert_eq!(cli_assets.cwd, None);
+        } else {
+            panic!("expected FirstClientConnected, got {:?}", msg);
+        }
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_existing_session_attach_keeps_cli_assets_cwd_none() {
+        // For existing-session attach the cwd is NOT baked into
+        // CliAssets — that path is handled by the U4
+        // ChangeFocusedPaneCwdIfShell message, which fires only after
+        // ServerToClientMsg::Connected.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::with_all_sessions_existing());
+        let session_manager_for_verification = mock_session_manager.clone();
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_attach",
+        )
+        .await;
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path={}",
+            port, web_client_id, "%2Ftmp%2Fdeep",
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let messages = session_manager_for_verification
+            .first_messages_sent
+            .lock()
+            .unwrap()
+            .clone();
+        let (_n, msg) = messages.first().expect("first_message captured");
+        match msg {
+            ClientToServerMsg::AttachClient { cli_assets, .. } => {
+                assert_eq!(
+                    cli_assets.cwd, None,
+                    "AttachClient.cli_assets.cwd should stay None on deep-link attach \
+                     — the cd-if-shell message owns the cwd path here"
+                );
+            },
+            other => panic!("expected AttachClient for existing session, got {:?}", other),
+        }
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_existing_session_emits_cd_if_shell_after_connected() {
+        // U4 trigger: once the mock delivers ServerToClientMsg::Connected,
+        // the listener should send ClientToServerMsg::ChangeFocusedPaneCwdIfShell
+        // with the validated path.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::with_all_sessions_existing());
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let factory_for_verification = mock_os_api_factory.clone();
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_cd",
+        )
+        .await;
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path={}",
+            port, web_client_id, "%2Ftmp%2Fdeep",
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+        // Give the listener thread a moment to attach and start polling.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mock_api = single_mock_os_api(&factory_for_verification);
+        // Inject the Connected handshake so the gated cd-if-shell send fires.
+        mock_api.queue_server_message(ServerToClientMsg::Connected);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // AttachClient is captured by MockSessionManager.spawn_session_if_needed
+        // (it never reaches mock_api.send_to_server). The cd-if-shell message,
+        // by contrast, flows through os_input.send_to_server after the
+        // listener sees Connected — so it lands in mock_api.get_sent_messages.
+        let sent = mock_api.get_sent_messages();
+        let path_value = sent.iter().find_map(|m| match m {
+            ClientToServerMsg::ChangeFocusedPaneCwdIfShell { path } => Some(path.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            path_value,
+            Some(PathBuf::from("/tmp/deep")),
+            "ChangeFocusedPaneCwdIfShell with the validated path should be sent after \
+             ServerToClientMsg::Connected; sent messages so far: {:?}",
+            sent
+        );
+
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_existing_session_holds_cd_if_shell_until_connected() {
+        // Regression for the AttachClient→cd-if-shell race fix: without
+        // Connected being delivered, the listener must NOT send the
+        // cd-if-shell message.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::with_all_sessions_existing());
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let factory_for_verification = mock_os_api_factory.clone();
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_holds",
+        )
+        .await;
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path={}",
+            port, web_client_id, "%2Ftmp%2Fheld",
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mock_api = single_mock_os_api(&factory_for_verification);
+        let sent = mock_api.get_sent_messages();
+        assert!(
+            !sent
+                .iter()
+                .any(|m| matches!(m, ClientToServerMsg::ChangeFocusedPaneCwdIfShell { .. })),
+            "cd-if-shell must wait for Connected; sent so far: {:?}",
+            sent
+        );
+
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_invalid_relative_path_surfaces_log_error() {
+        // R3 + U2: a relative path is a typo, not an attack — surface a
+        // LogError to the browser so the user sees the reason in the
+        // xterm area. New-session creation still proceeds with cwd=None.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::new());
+        let session_manager_for_verification = mock_session_manager.clone();
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_relative",
+        )
+        .await;
+
+        // Open the control WebSocket first so the LogError has a place
+        // to land. The order does not matter for production (the
+        // emitter retries until the channel exists) but pre-opening
+        // makes the test deterministic.
+        let control_ws_url = format!("ws://127.0.0.1:{}/ws/control", port);
+        let (control_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&control_ws_url, &session_token),
+        )
+        .await
+        .expect("control WS timeout")
+        .expect("control WS connect");
+        let (mut control_sink, mut control_stream) = control_ws.split();
+        // Drain the initial SetConfig.
+        let _ = timeout(Duration::from_secs(2), control_stream.next()).await;
+        // Send any message so the control channel is registered against
+        // this web_client_id (the connection table does the bind on
+        // first received frame).
+        let any_msg = WebClientToWebServerControlMessage {
+            web_client_id: web_client_id.clone(),
+            payload: WebClientToWebServerControlMessagePayload::TerminalResize(Size {
+                rows: 24,
+                cols: 80,
+            }),
+        };
+        control_sink
+            .send(Message::Text(serde_json::to_string(&any_msg).unwrap()))
+            .await
+            .expect("send any_msg");
+
+        // Now connect the terminal WS with an invalid path. axum URL-
+        // decodes once → the validator sees `relative` and rejects.
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path=relative",
+            port, web_client_id,
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+
+        // Wait for the LogError to land on the control stream.
+        let mut saw_log_error = false;
+        for _ in 0..40 {
+            match timeout(Duration::from_millis(200), control_stream.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<WebServerToWebClientControlMessage>(&text)
+                    {
+                        if let WebServerToWebClientControlMessage::LogError { lines } = parsed {
+                            if lines.iter().any(|l| l.contains("must be absolute")) {
+                                saw_log_error = true;
+                                break;
+                            }
+                        }
+                    }
+                },
+                _ => continue,
+            }
+        }
+        assert!(saw_log_error, "expected LogError with 'must be absolute'");
+
+        // And the first_message captured by the session manager must
+        // carry cwd=None — the invalid path is dropped, not silently
+        // forwarded. The listener may still be starting; give it a
+        // moment, then assert.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let messages = session_manager_for_verification
+            .first_messages_sent
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some((_n, msg)) = messages.first() {
+            if let ClientToServerMsg::FirstClientConnected { cli_assets, .. } = msg {
+                assert_eq!(
+                    cli_assets.cwd, None,
+                    "rejected path must not leak into CliAssets.cwd"
+                );
+            }
+        }
+
+        let _ = control_sink.close().await;
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deep_link_control_byte_path_is_silent_drop() {
+        // R3: a control byte embedded in the path is shape-invalid and
+        // looks like an attack probe — it must be dropped silently
+        // with NO LogError sent to the browser. We pick `/foo\x01bar`
+        // (SOH inside the path) so the value is unambiguously absolute
+        // AND carries a control byte through axum's URL decoding.
+        let _ = delete_db();
+        let mock_session_manager = Arc::new(MockSessionManager::new());
+        let mock_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        let (port, session_token, web_client_id, server_handle) = boot_web_server(
+            mock_session_manager,
+            mock_os_api_factory,
+            "deep_link_silent",
+        )
+        .await;
+        let control_ws_url = format!("ws://127.0.0.1:{}/ws/control", port);
+        let (control_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&control_ws_url, &session_token),
+        )
+        .await
+        .expect("control WS timeout")
+        .expect("control WS connect");
+        let (mut control_sink, mut control_stream) = control_ws.split();
+        let _ = timeout(Duration::from_secs(2), control_stream.next()).await;
+        let any_msg = WebClientToWebServerControlMessage {
+            web_client_id: web_client_id.clone(),
+            payload: WebClientToWebServerControlMessagePayload::TerminalResize(Size {
+                rows: 24,
+                cols: 80,
+            }),
+        };
+        control_sink
+            .send(Message::Text(serde_json::to_string(&any_msg).unwrap()))
+            .await
+            .expect("send any_msg");
+
+        let terminal_ws_url = format!(
+            "ws://127.0.0.1:{}/ws/terminal?web_client_id={}&path=%2Ffoo%01bar",
+            port, web_client_id,
+        );
+        let (terminal_ws, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_ws_url, &session_token),
+        )
+        .await
+        .expect("terminal WS timeout")
+        .expect("terminal WS connect");
+        let (mut terminal_sink, _terminal_stream) = terminal_ws.split();
+
+        let mut leaked_reason = false;
+        for _ in 0..20 {
+            match timeout(Duration::from_millis(150), control_stream.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<WebServerToWebClientControlMessage>(&text)
+                    {
+                        if let WebServerToWebClientControlMessage::LogError { lines } = parsed {
+                            if lines.iter().any(|l| l.contains("deep-link path rejected")) {
+                                leaked_reason = true;
+                                break;
+                            }
+                        }
+                    }
+                },
+                _ => continue,
+            }
+        }
+        assert!(
+            !leaked_reason,
+            "shape-invalid path must not surface a LogError reason"
+        );
+
+        let _ = control_sink.close().await;
+        let _ = terminal_sink.close().await;
+        server_handle.abort();
+        let _ = delete_db();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[derive(Debug, Clone)]

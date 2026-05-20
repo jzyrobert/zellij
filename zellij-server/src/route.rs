@@ -2589,6 +2589,21 @@ pub(crate) fn route_thread_main(
                                 retry_queue
                             );
                         },
+                        ClientToServerMsg::ChangeFocusedPaneCwdIfShell { path } => {
+                            // Watcher / read-only clients short-circuit
+                            // above; pane lookup and shell-allowlist
+                            // checks live on the pty thread, which
+                            // owns the relevant tables.
+                            if let Some(ref senders) = senders {
+                                let _ = senders.send_to_pty(
+                                    PtyInstruction::CdIfShellOnFocusedPane {
+                                        client_id,
+                                        path,
+                                        attempt: 0,
+                                    },
+                                );
+                            }
+                        },
                         ClientToServerMsg::SubscribeToPaneRenders {
                             ref pane_ids,
                             ref scrollback,

@@ -86,6 +86,9 @@ function sendSizeUpdate(wsControl, ownWebClientId, term, rows, cols) {
  * @param {Terminal} term - Terminal instance
  * @param {FitAddon} fitAddon - Terminal fit addon
  * @param {function} sendAnsiKey - Function to send ANSI key sequences
+ * @param {?string} deepLinkPath - Optional deep-link path captured from the
+ *   page URL's ?path= query argument. Forwarded as-is to the terminal
+ *   WebSocket; the server validates it. Pass null when no path was supplied.
  * @returns {object} Object containing WebSocket instances and cleanup function
  */
 export function initWebSockets(
@@ -93,7 +96,8 @@ export function initWebSockets(
     sessionName,
     term,
     fitAddon,
-    sendAnsiKey
+    sendAnsiKey,
+    deepLinkPath
 ) {
     let ownWebClientId = "";
     let wsTerminal;
@@ -106,8 +110,12 @@ export function initWebSockets(
             ? `${wsBaseUrl}/ws/terminal`
             : `${wsBaseUrl}/ws/terminal/${sessionName}`;
 
-    const queryString = `?web_client_id=${encodeURIComponent(webClientId)}`;
-    const wsTerminalUrl = `${url}${queryString}`;
+    const params = new URLSearchParams();
+    params.set("web_client_id", webClientId);
+    if (deepLinkPath) {
+        params.set("path", deepLinkPath);
+    }
+    const wsTerminalUrl = `${url}?${params.toString()}`;
 
     wsTerminal = new WebSocket(wsTerminalUrl);
 

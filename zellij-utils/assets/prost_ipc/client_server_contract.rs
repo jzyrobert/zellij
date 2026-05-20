@@ -2879,7 +2879,7 @@ impl WebSharing {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientToServerMsg {
-    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20")]
+    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21")]
     pub message: ::core::option::Option<client_to_server_msg::Message>,
 }
 /// Nested message and enum types in `ClientToServerMsg`.
@@ -2927,6 +2927,8 @@ pub mod client_to_server_msg {
         ForwardedReplyFromHost(super::ForwardedReplyFromHostMsg),
         #[prost(message, tag="20")]
         HostTerminalThemeChanged(super::HostTerminalThemeChangedMsg),
+        #[prost(message, tag="21")]
+        ChangeFocusedPaneCwdIfShell(super::ChangeFocusedPaneCwdIfShellMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3071,6 +3073,18 @@ pub struct ForwardedReplyFromHostMsg {
 pub struct HostTerminalThemeChangedMsg {
     #[prost(enumeration="HostTerminalThemeIndication", tag="1")]
     pub mode: i32,
+}
+/// Web-client deep-link: "if the focused pane is a known sh-family
+/// shell sitting at an idle prompt, type `cd '<path>'\n` into it".
+/// The server validates the read-only state, shell family, and
+/// foreground-cmd idle state before acting; the path itself is
+/// validated client-side (see `validate_deep_link_path`) so this
+/// message is safe to interpret byte-for-byte.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChangeFocusedPaneCwdIfShellMsg {
+    #[prost(string, tag="1")]
+    pub path: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

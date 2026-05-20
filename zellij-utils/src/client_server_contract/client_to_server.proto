@@ -25,6 +25,7 @@ message ClientToServerMsg {
     DesktopNotificationResponseMsg desktop_notification_response = 18;
     ForwardedReplyFromHostMsg forwarded_reply_from_host = 19;
     HostTerminalThemeChangedMsg host_terminal_theme_changed = 20;
+    ChangeFocusedPaneCwdIfShellMsg change_focused_pane_cwd_if_shell = 21;
   }
 }
 
@@ -119,6 +120,16 @@ message ForwardedReplyFromHostMsg {
 
 message HostTerminalThemeChangedMsg {
   HostTerminalThemeIndication mode = 1;
+}
+
+// Web-client deep-link: "if the focused pane is a known sh-family
+// shell sitting at an idle prompt, type `cd '<path>'\n` into it".
+// The server validates the read-only state, shell family, and
+// foreground-cmd idle state before acting; the path itself is
+// validated client-side (see `validate_deep_link_path`) so this
+// message is safe to interpret byte-for-byte.
+message ChangeFocusedPaneCwdIfShellMsg {
+  string path = 1;
 }
 
 enum HostTerminalThemeIndication {

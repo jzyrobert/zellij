@@ -13,11 +13,16 @@ use zellij_utils::{
 
 pub fn build_initial_connection(
     session_name: Option<String>,
+    initial_cwd: Option<PathBuf>,
     config: &Config,
 ) -> Result<Option<ConnectToSession>, &'static str> {
-    let should_start_with_welcome_screen = session_name.is_none();
     let default_layout_from_config =
         LayoutInfo::from_config(&config.options.layout_dir, &config.options.default_layout);
+    // A deep-link cwd is an explicit "start me a shell here" signal,
+    // so a path-without-session-name bypasses the welcome plugin and
+    // synthesizes a fresh session (welcome is for "I don't know what
+    // I want yet"; a path means the user already knows).
+    let should_start_with_welcome_screen = session_name.is_none() && initial_cwd.is_none();
     if should_start_with_welcome_screen {
         let Some(initial_session_name) = session_name.clone().or_else(generate_unique_session_name)
         else {
@@ -32,15 +37,22 @@ pub fn build_initial_connection(
         Ok(Some(ConnectToSession {
             name: Some(session_name.clone()),
             layout: default_layout_from_config,
-            ..Default::default()
-        }))
-    } else if default_layout_from_config.is_some() {
-        Ok(Some(ConnectToSession {
-            layout: default_layout_from_config,
+            cwd: initial_cwd,
             ..Default::default()
         }))
     } else {
-        Ok(None)
+        // session_name is None but initial_cwd is Some — synthesize a
+        // unique session so the deep link lands in a fresh shell at
+        // the requested cwd, default layout (not welcome).
+        let Some(generated) = generate_unique_session_name() else {
+            return Err("Failed to generate unique session name, bailing.");
+        };
+        Ok(Some(ConnectToSession {
+            name: Some(generated),
+            layout: default_layout_from_config,
+            cwd: initial_cwd,
+            ..Default::default()
+        }))
     }
 }
 
@@ -63,6 +75,7 @@ pub fn create_first_message(
     should_create_session: bool,
     session_name: &str,
     initial_layout: Option<LayoutInfo>,
+    initial_cwd: Option<PathBuf>,
 ) -> ClientToServerMsg {
     let resurrection_layout = resurrection_layout(&session_name).ok().flatten();
 
@@ -101,7 +114,7 @@ pub fn create_first_message(
             is_debug: false,
             max_panes: None,
             force_run_layout_commands: false,
-            cwd: None,
+            cwd: initial_cwd,
         };
 
         ClientToServerMsg::FirstClientConnected {

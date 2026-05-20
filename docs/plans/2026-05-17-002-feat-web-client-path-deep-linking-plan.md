@@ -1,7 +1,7 @@
 ---
 title: "feat: Web client path deep-linking via ?path= query argument"
 type: feat
-status: active
+status: completed
 date: 2026-05-17
 deepened: 2026-05-17
 ---

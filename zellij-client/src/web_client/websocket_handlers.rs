@@ -8,6 +8,7 @@ use crate::web_client::message_handlers::{
 };
 use crate::web_client::server_listener::zellij_server_listener;
 use crate::web_client::types::{AppState, TerminalParams};
+use crate::web_client::utils::validate_deep_link_path;
 
 use axum::{
     extract::{
@@ -17,13 +18,17 @@ use axum::{
     response::IntoResponse,
 };
 use futures::StreamExt;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::path::PathBuf;
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zellij_utils::{
     input::mouse::MouseEvent,
     ipc::{ClientToServerMsg, PixelDimensions},
     pane_size::SizeInPixels,
 };
+
+use crate::web_client::types::ConnectionTable;
 
 pub async fn ws_handler_control(
     ws: WebSocketUpgrade,
@@ -138,6 +143,86 @@ async fn handle_ws_control(
     }
 }
 
+/// Wait for the client's control-channel sender to appear in the
+/// connection table (the browser opens it asynchronously after the
+/// terminal WebSocket has already produced its first frame), then push
+/// a `LogError` so deep-link rejection feedback lands in the xterm
+/// area. Drops the message silently if the control channel never
+/// arrives within the budget.
+fn emit_deep_link_log_error(
+    connection_table: Arc<Mutex<ConnectionTable>>,
+    web_client_id: String,
+    reason: String,
+) {
+    tokio::spawn(async move {
+        let message = WebServerToWebClientControlMessage::LogError {
+            lines: vec![format!("deep-link path rejected: {}", reason)],
+        };
+        let payload = match serde_json::to_string(&message) {
+            Ok(json) => Message::Text(json.into()),
+            Err(e) => {
+                log::error!("Failed to serialize deep-link LogError: {}", e);
+                return;
+            },
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(tx) = connection_table
+                .lock()
+                .unwrap()
+                .get_client_control_tx(&web_client_id)
+            {
+                let _ = tx.send(payload);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::debug!(
+                    "Dropping deep-link LogError for {}: control channel never opened",
+                    web_client_id
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+}
+
+/// Apply `validate_deep_link_path` to the raw `?path=` value, splitting
+/// the result into the (validated cwd, optional human-readable
+/// rejection) the WebSocket handler hands forward. Errors that look
+/// like attack probes (control bytes) are dropped silently and logged
+/// only as a fingerprint — never the raw path — so log readers cannot
+/// enumerate the filesystem by repeatedly issuing bad URLs.
+fn process_deep_link_path(raw: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    match validate_deep_link_path(raw) {
+        Ok(Some(path)) => {
+            log::debug!("deep-link accepted, len={}", raw.len());
+            (Some(path), None)
+        },
+        Ok(None) => (None, None),
+        Err(err) if err.is_silent_drop() => {
+            log::warn!(
+                "deep-link silently dropped: reason={:?}, len={}, leading_byte={:?}",
+                std::mem::discriminant(&err),
+                raw.len(),
+                raw.as_bytes().first(),
+            );
+            (None, None)
+        },
+        Err(err) => {
+            log::debug!(
+                "deep-link rejected: reason={:?}, len={}",
+                std::mem::discriminant(&err),
+                raw.len(),
+            );
+            (None, Some(err.to_string()))
+        },
+    }
+}
+
 async fn handle_ws_terminal(
     socket: WebSocket,
     session_name: Option<AxumPath<String>>,
@@ -172,6 +257,18 @@ async fn handle_ws_terminal(
         return;
     };
 
+    // Validate the deep-link path before any state mutation. Shape-invalid
+    // values (control bytes etc.) are dropped silently; semantically-invalid
+    // values surface to the browser via the control channel once it's open.
+    let (initial_cwd, deep_link_reject_reason) = process_deep_link_path(params.path.as_deref());
+    if let Some(reason) = deep_link_reject_reason {
+        emit_deep_link_log_error(
+            state.connection_table.clone(),
+            web_client_id.clone(),
+            reason,
+        );
+    }
+
     let (client_terminal_channel_tx, mut client_terminal_channel_rx) = socket.split();
     let (stdout_channel_tx, stdout_channel_rx) = tokio::sync::mpsc::unbounded_channel();
     state
@@ -192,6 +289,7 @@ async fn handle_ws_terminal(
         web_client_id.clone(),
         state.session_manager.clone(),
         Some(attachment_complete_tx),
+        initial_cwd,
     );
 
     let terminal_channel_cancellation_token = CancellationToken::new();

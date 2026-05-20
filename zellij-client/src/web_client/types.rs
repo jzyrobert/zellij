@@ -176,6 +176,11 @@ pub struct CreateClientIdResponse {
 #[derive(Deserialize)]
 pub struct TerminalParams {
     pub web_client_id: String,
+    /// Optional deep-link path from the page's `?path=` query
+    /// argument, forwarded by the frontend. Validated server-side via
+    /// `validate_deep_link_path`; absent / empty / invalid values are
+    /// treated as "no deep link" (existing behaviour).
+    pub path: Option<String>,
 }
 
 #[derive(Deserialize)]

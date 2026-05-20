@@ -496,6 +496,7 @@ pub enum PtyContext {
     GetPaneCwd,
     UpdateAndReportCwds,
     NotifyCwdFromOsc7,
+    CdIfShellOnFocusedPane,
     Exit,
 }
 
